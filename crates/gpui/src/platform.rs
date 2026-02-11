@@ -460,6 +460,17 @@ impl Default for WindowControls {
     }
 }
 
+/// Runtime capabilities for backdrop/material effects.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
+pub struct BackdropCapabilities {
+    /// Whether window-level system material is supported.
+    pub window_material: bool,
+    /// Whether region/element-level system material is supported.
+    pub region_material: bool,
+    /// Whether renderer-backed backdrop blur is supported.
+    pub renderer_backdrop_blur: bool,
+}
+
 /// A type to describe which sides of the window are currently tiled in some way
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default)]
 pub struct Tiling {
@@ -522,6 +533,9 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn is_active(&self) -> bool;
     fn is_hovered(&self) -> bool;
     fn background_appearance(&self) -> WindowBackgroundAppearance;
+    fn backdrop_capabilities(&self) -> BackdropCapabilities {
+        BackdropCapabilities::default()
+    }
     fn set_title(&mut self, title: &str);
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
     fn minimize(&self);

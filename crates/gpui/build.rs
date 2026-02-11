@@ -135,9 +135,11 @@ mod macos {
             "ShadowInputIndex".into(),
             "Shadow".into(),
             "QuadInputIndex".into(),
+            "BackdropInputIndex".into(),
             "Underline".into(),
             "UnderlineInputIndex".into(),
             "Quad".into(),
+            "Backdrop".into(),
             "BorderStyle".into(),
             "SpriteInputIndex".into(),
             "MonochromeSprite".into(),
@@ -292,6 +294,7 @@ mod windows {
         // Define all modules
         let modules = [
             "quad",
+            "backdrop",
             "shadow",
             "path_rasterization",
             "path_sprite",

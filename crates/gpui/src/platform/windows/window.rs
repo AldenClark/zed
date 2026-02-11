@@ -794,6 +794,14 @@ impl PlatformWindow for WindowsWindow {
         self.state.background_appearance.get()
     }
 
+    fn backdrop_capabilities(&self) -> BackdropCapabilities {
+        BackdropCapabilities {
+            window_material: true,
+            region_material: false,
+            renderer_backdrop_blur: true,
+        }
+    }
+
     fn is_subpixel_rendering_supported(&self) -> bool {
         true
     }

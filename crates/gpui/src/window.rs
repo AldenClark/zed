@@ -2,22 +2,23 @@
 use crate::Inspector;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
-    Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
-    DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
-    FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
-    KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId,
-    LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
-    MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
-    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
-    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
-    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
-    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
-    TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point, prelude::*, px, rems, size, transparent_black,
+    AsyncWindowContext, AvailableSpace, Backdrop, BackdropCapabilities, Background, BorderStyle,
+    Bounds, BoxShadow, Capslock, Context, Corners, CursorStyle, Decorations, DevicePixels,
+    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
+    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
+    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
+    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
+    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
+    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
+    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
+    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
+    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
+    transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -1994,6 +1995,26 @@ impl Window {
         self.platform_window.window_controls()
     }
 
+    /// Returns runtime backdrop/material capabilities for the current platform window.
+    pub fn backdrop_capabilities(&self) -> BackdropCapabilities {
+        self.platform_window.backdrop_capabilities()
+    }
+
+    /// Whether window-level system material is supported.
+    pub fn supports_window_material(&self) -> bool {
+        self.backdrop_capabilities().window_material
+    }
+
+    /// Whether region/element-level system material is supported.
+    pub fn supports_region_material(&self) -> bool {
+        self.backdrop_capabilities().region_material
+    }
+
+    /// Whether renderer-backed backdrop blur is supported.
+    pub fn supports_renderer_backdrop_blur(&self) -> bool {
+        self.backdrop_capabilities().renderer_backdrop_blur
+    }
+
     /// Updates the window's title at the platform level.
     pub fn set_window_title(&mut self, title: &str) {
         self.platform_window.set_title(title);
@@ -3114,6 +3135,25 @@ impl Window {
             corner_radii: quad.corner_radii.scale(scale_factor),
             border_widths: quad.border_widths.scale(scale_factor),
             border_style: quad.border_style,
+        });
+    }
+
+    /// Paint a backdrop-blur region into the scene for the next frame at the current stacking context.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_backdrop(&mut self, backdrop: PaintBackdrop) {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask();
+        let opacity = self.element_opacity();
+        self.next_frame.scene.insert_primitive(Backdrop {
+            order: 0,
+            blur_radius: backdrop.blur_radius.scale(scale_factor),
+            bounds: backdrop.bounds.scale(scale_factor),
+            content_mask: content_mask.scale(scale_factor),
+            corner_radii: backdrop.corner_radii.scale(scale_factor),
+            tint: backdrop.tint.opacity(opacity),
         });
     }
 
@@ -5414,6 +5454,46 @@ pub struct PaintQuad {
     pub border_style: BorderStyle,
 }
 
+/// A backdrop region to be rendered in the window at the given position and size.
+/// Passed as an argument to [`Window::paint_backdrop`].
+#[derive(Clone)]
+pub struct PaintBackdrop {
+    /// The bounds of the backdrop region within the window.
+    pub bounds: Bounds<Pixels>,
+    /// The radii of the backdrop's corners.
+    pub corner_radii: Corners<Pixels>,
+    /// Blur radius in logical pixels.
+    pub blur_radius: Pixels,
+    /// Tint color composited on top of the blurred backdrop.
+    pub tint: Hsla,
+}
+
+impl PaintBackdrop {
+    /// Sets the corner radii of the backdrop.
+    pub fn corner_radii(self, corner_radii: impl Into<Corners<Pixels>>) -> Self {
+        Self {
+            corner_radii: corner_radii.into(),
+            ..self
+        }
+    }
+
+    /// Sets the blur radius of the backdrop.
+    pub fn blur_radius(self, blur_radius: Pixels) -> Self {
+        Self {
+            blur_radius,
+            ..self
+        }
+    }
+
+    /// Sets the tint color of the backdrop.
+    pub fn tint(self, tint: impl Into<Hsla>) -> Self {
+        Self {
+            tint: tint.into(),
+            ..self
+        }
+    }
+}
+
 impl PaintQuad {
     /// Sets the corner radii of the quad.
     pub fn corner_radii(self, corner_radii: impl Into<Corners<Pixels>>) -> Self {
@@ -5464,6 +5544,21 @@ pub fn quad(
         border_widths: border_widths.into(),
         border_color: border_color.into(),
         border_style,
+    }
+}
+
+/// Creates a backdrop with the given parameters.
+pub fn backdrop(
+    bounds: Bounds<Pixels>,
+    corner_radii: impl Into<Corners<Pixels>>,
+    blur_radius: Pixels,
+    tint: impl Into<Hsla>,
+) -> PaintBackdrop {
+    PaintBackdrop {
+        bounds,
+        corner_radii: corner_radii.into(),
+        blur_radius,
+        tint: tint.into(),
     }
 }
 

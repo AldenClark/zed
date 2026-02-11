@@ -827,6 +827,96 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
 
 /*
 **
+**              Backdrops
+**
+*/
+
+struct Backdrop {
+    uint order;
+    float blur_radius;
+    Bounds bounds;
+    Bounds content_mask;
+    Corners corner_radii;
+    Hsla tint;
+};
+
+struct BackdropVertexOutput {
+    nointerpolation uint backdrop_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct BackdropFragmentInput {
+  nointerpolation uint backdrop_id: TEXCOORD0;
+  float4 position: SV_Position;
+};
+
+StructuredBuffer<Backdrop> backdrops: register(t1);
+
+BackdropVertexOutput backdrop_vertex(uint vertex_id: SV_VertexID, uint backdrop_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    Backdrop backdrop = backdrops[backdrop_id];
+    float4 device_position = to_device_position(unit_vertex, backdrop.bounds);
+    float4 clip_distance = distance_from_clip_rect(unit_vertex, backdrop.bounds, backdrop.content_mask);
+
+    BackdropVertexOutput output;
+    output.position = device_position;
+    output.backdrop_id = backdrop_id;
+    output.clip_distance = clip_distance;
+    return output;
+}
+
+float4 backdrop_fragment(BackdropFragmentInput input): SV_Target {
+    Backdrop backdrop = backdrops[input.backdrop_id];
+    float distance = quad_sdf(input.position.xy, backdrop.bounds, backdrop.corner_radii);
+    float edge_alpha = saturate(0.5 - distance);
+    if (edge_alpha <= 0.0) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+
+    float2 viewport = max(global_viewport_size, float2(1.0, 1.0));
+    float2 uv = input.position.xy / viewport;
+    float2 texel = 1.0 / viewport;
+    float blur_radius = clamp(backdrop.blur_radius, 0.0, 36.0);
+    float sigma = max(0.9, blur_radius * 0.52);
+    int kernel_radius = min(max((int)round(blur_radius * 0.45), 1), 6);
+    float sigma2 = 2.0 * sigma * sigma;
+
+    float4 blurred = float4(0.0, 0.0, 0.0, 0.0);
+    float weight_sum = 0.0;
+    for (int y = -6; y <= 6; y++) {
+        if (abs(y) > kernel_radius) {
+            continue;
+        }
+        for (int x = -6; x <= 6; x++) {
+            if (abs(x) > kernel_radius) {
+                continue;
+            }
+            float2 offset = float2(float(x), float(y)) * texel;
+            float2 sample_uv = saturate(uv + offset);
+            float weight = exp(-(float(x * x + y * y)) / sigma2);
+            blurred += t_sprite.Sample(s_sprite, sample_uv) * weight;
+            weight_sum += weight;
+        }
+    }
+
+    if (weight_sum > 0.0) {
+        blurred /= weight_sum;
+    } else {
+        blurred = t_sprite.Sample(s_sprite, saturate(uv));
+    }
+
+    float4 tint = hsla_to_rgba(backdrop.tint);
+    float alpha = tint.a + blurred.a * (1.0 - tint.a);
+    float3 rgb = (alpha > 0.00001)
+        ? ((tint.rgb * tint.a + blurred.rgb * blurred.a * (1.0 - tint.a)) / alpha)
+        : float3(0.0, 0.0, 0.0);
+
+    return float4(rgb, alpha) * float4(1.0, 1.0, 1.0, edge_alpha);
+}
+
+/*
+**
 **              Shadows
 **
 */

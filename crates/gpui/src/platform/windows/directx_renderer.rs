@@ -78,6 +78,8 @@ struct DirectXResources {
     path_intermediate_srv: Option<ID3D11ShaderResourceView>,
     path_intermediate_msaa_texture: ID3D11Texture2D,
     path_intermediate_msaa_view: Option<ID3D11RenderTargetView>,
+    backdrop_source_texture: ID3D11Texture2D,
+    backdrop_source_srv: Option<ID3D11ShaderResourceView>,
 
     // Cached viewport
     viewport: D3D11_VIEWPORT,
@@ -86,6 +88,7 @@ struct DirectXResources {
 struct DirectXRenderPipelines {
     shadow_pipeline: PipelineState<Shadow>,
     quad_pipeline: PipelineState<Quad>,
+    backdrop_pipeline: PipelineState<Backdrop>,
     path_rasterization_pipeline: PipelineState<PathRasterizationSprite>,
     path_sprite_pipeline: PipelineState<PathSprite>,
     underline_pipeline: PipelineState<Underline>,
@@ -322,6 +325,10 @@ impl DirectXRenderer {
             match batch {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
+                PrimitiveBatch::Backdrops(range) => {
+                    self.copy_render_target_to_backdrop_source()?;
+                    self.draw_backdrops(range.start, range.len())
+                }
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     self.draw_paths_to_intermediate(paths)?;
@@ -341,10 +348,11 @@ impl DirectXRenderer {
             }
             .context(format!(
                 "scene too large:\
-                {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces",
+                {} paths, {} shadows, {} quads, {} backdrops, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces",
                 scene.paths.len(),
                 scene.shadows.len(),
                 scene.quads.len(),
+                scene.backdrops.len(),
                 scene.underlines.len(),
                 scene.monochrome_sprites.len(),
                 scene.subpixel_sprites.len(),
@@ -415,6 +423,14 @@ impl DirectXRenderer {
                 &devices.device,
                 &devices.device_context,
                 &scene.quads,
+            )?;
+        }
+
+        if !scene.backdrops.is_empty() {
+            self.pipelines.backdrop_pipeline.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                &scene.backdrops,
             )?;
         }
 
@@ -560,6 +576,48 @@ impl DirectXRenderer {
         }
 
         Ok(())
+    }
+
+    fn copy_render_target_to_backdrop_source(&mut self) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let render_target = resources
+            .render_target
+            .as_ref()
+            .context("missing render target")?;
+
+        unsafe {
+            let null_srv: [Option<ID3D11ShaderResourceView>; 1] = [None];
+            devices
+                .device_context
+                .PSSetShaderResources(0, Some(&null_srv));
+            devices
+                .device_context
+                .VSSetShaderResources(0, Some(&null_srv));
+            devices
+                .device_context
+                .CopyResource(&resources.backdrop_source_texture, render_target);
+        }
+        Ok(())
+    }
+
+    fn draw_backdrops(&mut self, start: usize, len: usize) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        self.pipelines.backdrop_pipeline.draw_range_with_texture(
+            &devices.device,
+            &devices.device_context,
+            slice::from_ref(&resources.backdrop_source_srv),
+            slice::from_ref(&resources.viewport),
+            slice::from_ref(&self.globals.global_params_buffer),
+            slice::from_ref(&self.globals.sampler),
+            start as u32,
+            len as u32,
+        )
     }
 
     fn draw_paths_from_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
@@ -779,6 +837,8 @@ impl DirectXResources {
             path_intermediate_srv,
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
+            backdrop_source_texture,
+            backdrop_source_srv,
             viewport,
         ) = create_resources(devices, &swap_chain, width, height)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
@@ -791,6 +851,8 @@ impl DirectXResources {
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
             path_intermediate_srv,
+            backdrop_source_texture,
+            backdrop_source_srv,
             viewport,
         })
     }
@@ -809,6 +871,8 @@ impl DirectXResources {
             path_intermediate_srv,
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
+            backdrop_source_texture,
+            backdrop_source_srv,
             viewport,
         ) = create_resources(devices, &self.swap_chain, width, height)?;
         self.render_target = Some(render_target);
@@ -817,6 +881,8 @@ impl DirectXResources {
         self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
         self.path_intermediate_msaa_view = path_intermediate_msaa_view;
         self.path_intermediate_srv = path_intermediate_srv;
+        self.backdrop_source_texture = backdrop_source_texture;
+        self.backdrop_source_srv = backdrop_source_srv;
         self.viewport = viewport;
         Ok(())
     }
@@ -835,6 +901,13 @@ impl DirectXRenderPipelines {
             device,
             "quad_pipeline",
             ShaderModule::Quad,
+            64,
+            create_blend_state(device)?,
+        )?;
+        let backdrop_pipeline = PipelineState::new(
+            device,
+            "backdrop_pipeline",
+            ShaderModule::Backdrop,
             64,
             create_blend_state(device)?,
         )?;
@@ -884,6 +957,7 @@ impl DirectXRenderPipelines {
         Ok(Self {
             shadow_pipeline,
             quad_pipeline,
+            backdrop_pipeline,
             path_rasterization_pipeline,
             path_sprite_pipeline,
             underline_pipeline,
@@ -1243,6 +1317,8 @@ fn create_resources(
     Option<ID3D11ShaderResourceView>,
     ID3D11Texture2D,
     Option<ID3D11RenderTargetView>,
+    ID3D11Texture2D,
+    Option<ID3D11ShaderResourceView>,
     D3D11_VIEWPORT,
 )> {
     let (render_target, render_target_view) =
@@ -1251,6 +1327,8 @@ fn create_resources(
         create_path_intermediate_texture(&devices.device, width, height)?;
     let (path_intermediate_msaa_texture, path_intermediate_msaa_view) =
         create_path_intermediate_msaa_texture_and_view(&devices.device, width, height)?;
+    let (backdrop_source_texture, backdrop_source_srv) =
+        create_backdrop_source_texture(&devices.device, width, height)?;
     let viewport = set_viewport(&devices.device_context, width as f32, height as f32);
     Ok((
         render_target,
@@ -1259,6 +1337,8 @@ fn create_resources(
         path_intermediate_srv,
         path_intermediate_msaa_texture,
         path_intermediate_msaa_view,
+        backdrop_source_texture,
+        backdrop_source_srv,
         viewport,
     ))
 }
@@ -1336,6 +1416,39 @@ fn create_path_intermediate_msaa_texture_and_view(
     let mut msaa_view = None;
     unsafe { device.CreateRenderTargetView(&msaa_texture, None, Some(&mut msaa_view))? };
     Ok((msaa_texture, Some(msaa_view.unwrap())))
+}
+
+#[inline]
+fn create_backdrop_source_texture(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+) -> Result<(ID3D11Texture2D, Option<ID3D11ShaderResourceView>)> {
+    let texture = unsafe {
+        let mut output = None;
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: RENDER_TARGET_FORMAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        device.CreateTexture2D(&desc, None, Some(&mut output))?;
+        output.unwrap()
+    };
+
+    let mut shader_resource_view = None;
+    unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut shader_resource_view))? };
+
+    Ok((texture, Some(shader_resource_view.unwrap())))
 }
 
 #[inline]
@@ -1593,6 +1706,7 @@ pub(crate) mod shader_resources {
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
     pub(crate) enum ShaderModule {
         Quad,
+        Backdrop,
         Shadow,
         Underline,
         PathRasterization,
@@ -1645,6 +1759,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::Quad => match target {
                     ShaderTarget::Vertex => QUAD_VERTEX_BYTES,
                     ShaderTarget::Fragment => QUAD_FRAGMENT_BYTES,
+                },
+                ShaderModule::Backdrop => match target {
+                    ShaderTarget::Vertex => BACKDROP_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BACKDROP_FRAGMENT_BYTES,
                 },
                 ShaderModule::Shadow => match target {
                     ShaderTarget::Vertex => SHADOW_VERTEX_BYTES,
@@ -1757,6 +1875,7 @@ pub(crate) mod shader_resources {
         pub fn as_str(self) -> &'static str {
             match self {
                 ShaderModule::Quad => "quad",
+                ShaderModule::Backdrop => "backdrop",
                 ShaderModule::Shadow => "shadow",
                 ShaderModule::Underline => "underline",
                 ShaderModule::PathRasterization => "path_rasterization",

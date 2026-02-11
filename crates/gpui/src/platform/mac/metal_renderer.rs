@@ -1,8 +1,8 @@
 use super::metal_atlas::MetalAtlas;
 use crate::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
-    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    Surface, Underline, point, size,
+    AtlasTextureId, Backdrop, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite,
+    PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow,
+    Size, Surface, Underline, point, size,
 };
 use anyhow::Result;
 use block::ConcreteBlock;
@@ -107,6 +107,7 @@ pub(crate) struct MetalRenderer {
     path_sprites_pipeline_state: metal::RenderPipelineState,
     shadows_pipeline_state: metal::RenderPipelineState,
     quads_pipeline_state: metal::RenderPipelineState,
+    backdrops_pipeline_state: metal::RenderPipelineState,
     underlines_pipeline_state: metal::RenderPipelineState,
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
@@ -118,6 +119,7 @@ pub(crate) struct MetalRenderer {
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
+    backdrop_source_texture: Option<metal::Texture>,
     path_sample_count: u32,
 }
 
@@ -241,6 +243,14 @@ impl MetalRenderer {
             "underline_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let backdrops_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "backdrops",
+            "backdrop_vertex",
+            "backdrop_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
         let monochrome_sprites_pipeline_state = build_pipeline_state(
             &device,
             &library,
@@ -280,6 +290,7 @@ impl MetalRenderer {
             path_sprites_pipeline_state,
             shadows_pipeline_state,
             quads_pipeline_state,
+            backdrops_pipeline_state,
             underlines_pipeline_state,
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
@@ -290,6 +301,7 @@ impl MetalRenderer {
             core_video_texture_cache,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
+            backdrop_source_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
         }
     }
@@ -328,6 +340,7 @@ impl MetalRenderer {
             height: DevicePixels(size.height as i32),
         };
         self.update_path_intermediate_textures(device_pixels_size);
+        self.update_backdrop_source_texture(device_pixels_size);
     }
 
     fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
@@ -357,6 +370,25 @@ impl MetalRenderer {
         } else {
             self.path_intermediate_msaa_texture = None;
         }
+    }
+
+    fn update_backdrop_source_texture(&mut self, size: Size<DevicePixels>) {
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            self.backdrop_source_texture = None;
+            return;
+        }
+
+        let texture_descriptor = metal::TextureDescriptor::new();
+        texture_descriptor.set_width(size.width.0 as u64);
+        texture_descriptor.set_height(size.height.0 as u64);
+        texture_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        texture_descriptor.set_usage(
+            metal::MTLTextureUsage::ShaderRead
+                | metal::MTLTextureUsage::ShaderWrite
+                | metal::MTLTextureUsage::RenderTarget,
+        );
+        texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        self.backdrop_source_texture = Some(self.device.new_texture(&texture_descriptor));
     }
 
     pub fn update_transparency(&self, transparent: bool) {
@@ -562,6 +594,25 @@ impl MetalRenderer {
                     viewport_size,
                     command_encoder,
                 ),
+                PrimitiveBatch::Backdrops(range) => {
+                    command_encoder.end_encoding();
+                    self.copy_drawable_to_backdrop_source(command_buffer, drawable.texture());
+                    command_encoder = new_command_encoder(
+                        command_buffer,
+                        drawable,
+                        viewport_size,
+                        |color_attachment| {
+                            color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                        },
+                    );
+                    self.draw_backdrops(
+                        &scene.backdrops[range],
+                        instance_buffer,
+                        &mut instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    )
+                }
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     command_encoder.end_encoding();
@@ -632,10 +683,11 @@ impl MetalRenderer {
             if !ok {
                 command_encoder.end_encoding();
                 anyhow::bail!(
-                    "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
+                    "scene too large: {} paths, {} shadows, {} quads, {} backdrops, {} underlines, {} mono, {} poly, {} surfaces",
                     scene.paths.len(),
                     scene.shadows.len(),
                     scene.quads.len(),
+                    scene.backdrops.len(),
                     scene.underlines.len(),
                     scene.monochrome_sprites.len(),
                     scene.polychrome_sprites.len(),
@@ -856,6 +908,118 @@ impl MetalRenderer {
             0,
             6,
             quads.len() as u64,
+        );
+        *instance_offset = next_offset;
+        true
+    }
+
+    fn copy_drawable_to_backdrop_source(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        drawable_texture: &metal::TextureRef,
+    ) {
+        let Some(backdrop_source_texture) = &self.backdrop_source_texture else {
+            return;
+        };
+
+        let copy_size = metal::MTLSize {
+            width: drawable_texture
+                .width()
+                .min(backdrop_source_texture.width()),
+            height: drawable_texture
+                .height()
+                .min(backdrop_source_texture.height()),
+            depth: 1,
+        };
+        if copy_size.width == 0 || copy_size.height == 0 {
+            return;
+        }
+
+        let blit_encoder = command_buffer.new_blit_command_encoder();
+        blit_encoder.copy_from_texture(
+            drawable_texture,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            copy_size,
+            backdrop_source_texture,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+        );
+        blit_encoder.end_encoding();
+    }
+
+    fn draw_backdrops(
+        &self,
+        backdrops: &[Backdrop],
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
+        if backdrops.is_empty() {
+            return true;
+        }
+
+        let Some(backdrop_source_texture) = &self.backdrop_source_texture else {
+            return true;
+        };
+
+        align_offset(instance_offset);
+
+        command_encoder.set_render_pipeline_state(&self.backdrops_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            BackdropInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_buffer(
+            BackdropInputIndex::Backdrops as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
+            BackdropInputIndex::Backdrops as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_vertex_bytes(
+            BackdropInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_bytes(
+            BackdropInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_texture(
+            BackdropInputIndex::SourceTexture as u64,
+            Some(backdrop_source_texture),
+        );
+
+        let backdrop_bytes_len = mem::size_of_val(backdrops);
+        let buffer_contents =
+            unsafe { (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset) };
+        let next_offset = *instance_offset + backdrop_bytes_len;
+        if next_offset > instance_buffer.size {
+            return false;
+        }
+
+        unsafe {
+            ptr::copy_nonoverlapping(
+                backdrops.as_ptr() as *const u8,
+                buffer_contents,
+                backdrop_bytes_len,
+            );
+        }
+
+        command_encoder.draw_primitives_instanced(
+            metal::MTLPrimitiveType::Triangle,
+            0,
+            6,
+            backdrops.len() as u64,
         );
         *instance_offset = next_offset;
         true
@@ -1413,6 +1577,14 @@ enum QuadInputIndex {
     Vertices = 0,
     Quads = 1,
     ViewportSize = 2,
+}
+
+#[repr(C)]
+enum BackdropInputIndex {
+    Vertices = 0,
+    Backdrops = 1,
+    ViewportSize = 2,
+    SourceTexture = 3,
 }
 
 #[repr(C)]

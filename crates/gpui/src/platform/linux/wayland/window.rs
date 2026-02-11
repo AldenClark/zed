@@ -26,11 +26,11 @@ use wayland_protocols_plasma::blur::client::org_kde_kwin_blur;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
 use crate::{
-    AnyWindowHandle, Bounds, Decorations, Globals, GpuSpecs, Modifiers, Output, Pixels,
-    PlatformDisplay, PlatformInput, Point, PromptButton, PromptLevel, RequestFrameOptions,
-    ResizeEdge, Size, Tiling, WaylandClientStatePtr, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowControls, WindowDecorations, WindowParams, get_window,
-    layer_shell::LayerShellNotSupportedError, px, size,
+    AnyWindowHandle, BackdropCapabilities, Bounds, Decorations, Globals, GpuSpecs, Modifiers,
+    Output, Pixels, PlatformDisplay, PlatformInput, Point, PromptButton, PromptLevel,
+    RequestFrameOptions, ResizeEdge, Size, Tiling, WaylandClientStatePtr, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
+    WindowParams, get_window, layer_shell::LayerShellNotSupportedError, px, size,
 };
 use crate::{
     Capslock,
@@ -1222,6 +1222,15 @@ impl PlatformWindow for WaylandWindow {
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
         self.borrow().background_appearance
+    }
+
+    fn backdrop_capabilities(&self) -> BackdropCapabilities {
+        let state = self.borrow();
+        BackdropCapabilities {
+            window_material: state.globals.blur_manager.is_some(),
+            region_material: false,
+            renderer_backdrop_blur: true,
+        }
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {

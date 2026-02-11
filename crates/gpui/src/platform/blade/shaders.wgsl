@@ -941,6 +941,91 @@ fn fmod(a: f32, b: f32) -> f32 {
     return a - b * trunc(a / b);
 }
 
+// --- backdrops --- //
+
+struct Backdrop {
+    order: u32,
+    blur_radius: f32,
+    bounds: Bounds,
+    content_mask: Bounds,
+    corner_radii: Corners,
+    tint: Hsla,
+}
+var<storage, read> b_backdrops: array<Backdrop>;
+
+struct BackdropVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) backdrop_id: u32,
+    // TODO: use `clip_distance` once Naga supports it
+    @location(1) clip_distances: vec4<f32>,
+}
+
+@vertex
+fn vs_backdrop(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> BackdropVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let backdrop = b_backdrops[instance_id];
+
+    var out = BackdropVarying();
+    out.position = to_device_position(unit_vertex, backdrop.bounds);
+    out.backdrop_id = instance_id;
+    out.clip_distances = distance_from_clip_rect(unit_vertex, backdrop.bounds, backdrop.content_mask);
+    return out;
+}
+
+@fragment
+fn fs_backdrop(input: BackdropVarying) -> @location(0) vec4<f32> {
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+
+    let backdrop = b_backdrops[input.backdrop_id];
+    let distance = quad_sdf(input.position.xy, backdrop.bounds, backdrop.corner_radii);
+    let edge_alpha = saturate(0.5 - distance);
+    if (edge_alpha <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+
+    let viewport = max(globals.viewport_size, vec2<f32>(1.0, 1.0));
+    let uv = input.position.xy / viewport;
+    let texel = 1.0 / viewport;
+    let blur_radius = clamp(backdrop.blur_radius, 0.0, 36.0);
+    let sigma = max(0.9, blur_radius * 0.52);
+    let kernel_radius = i32(clamp(round(blur_radius * 0.45), 1.0, 6.0));
+    let sigma2 = 2.0 * sigma * sigma;
+
+    var blurred = vec4<f32>(0.0);
+    var weight_sum = 0.0;
+    for (var y = -6; y <= 6; y += 1) {
+        if (abs(y) > kernel_radius) {
+            continue;
+        }
+        for (var x = -6; x <= 6; x += 1) {
+            if (abs(x) > kernel_radius) {
+                continue;
+            }
+            let offset = vec2<f32>(f32(x), f32(y)) * texel;
+            let sample_uv = clamp(uv + offset, vec2<f32>(0.0), vec2<f32>(1.0));
+            let distance2 = f32(x * x + y * y);
+            let weight = exp(-(distance2) / sigma2);
+            blurred += textureSample(t_sprite, s_sprite, sample_uv) * weight;
+            weight_sum += weight;
+        }
+    }
+    if (weight_sum > 0.0) {
+        blurred /= weight_sum;
+    } else {
+        blurred = textureSample(t_sprite, s_sprite, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)));
+    }
+
+    let tint = hsla_to_rgba(backdrop.tint);
+    let alpha = tint.a + blurred.a * (1.0 - tint.a);
+    var rgb = vec3<f32>(0.0);
+    if (alpha > 0.00001) {
+        rgb = (tint.rgb * tint.a + blurred.rgb * blurred.a * (1.0 - tint.a)) / alpha;
+    }
+    return blend_color(vec4<f32>(rgb, alpha), edge_alpha);
+}
+
 // --- shadows --- //
 
 struct Shadow {

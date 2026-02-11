@@ -396,6 +396,89 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
 }
 
+struct BackdropVertexOutput {
+  uint backdrop_id [[flat]];
+  float4 position [[position]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct BackdropFragmentInput {
+  uint backdrop_id [[flat]];
+  float4 position [[position]];
+};
+
+vertex BackdropVertexOutput backdrop_vertex(
+    uint unit_vertex_id [[vertex_id]], uint backdrop_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(BackdropInputIndex_Vertices)]],
+    constant Backdrop *backdrops [[buffer(BackdropInputIndex_Backdrops)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(BackdropInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  Backdrop backdrop = backdrops[backdrop_id];
+  float4 device_position =
+      to_device_position(unit_vertex, backdrop.bounds, viewport_size);
+  float4 clip_distance = distance_from_clip_rect(unit_vertex, backdrop.bounds,
+                                                 backdrop.content_mask.bounds);
+  return BackdropVertexOutput{
+      backdrop_id,
+      device_position,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+fragment float4 backdrop_fragment(
+    BackdropFragmentInput input [[stage_in]],
+    constant Backdrop *backdrops [[buffer(BackdropInputIndex_Backdrops)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(BackdropInputIndex_ViewportSize)]],
+    texture2d<float> source_texture [[texture(BackdropInputIndex_SourceTexture)]]) {
+  Backdrop backdrop = backdrops[input.backdrop_id];
+
+  float distance = quad_sdf(input.position.xy, backdrop.bounds, backdrop.corner_radii);
+  float edge_alpha = saturate(0.5 - distance);
+  if (edge_alpha <= 0.0) {
+    return float4(0.0);
+  }
+
+  float2 viewport = float2(max((float)viewport_size->width, 1.0),
+                           max((float)viewport_size->height, 1.0));
+  float2 uv = input.position.xy / viewport;
+  float2 texel = 1.0 / viewport;
+  float blur_radius = clamp(backdrop.blur_radius, 0.0, 36.0);
+  float sigma = max(0.9, blur_radius * 0.52);
+  int kernel_radius = int(clamp(round(blur_radius * 0.45), 1.0, 6.0));
+
+  constexpr sampler backdrop_sampler(mag_filter::linear,
+                                     min_filter::linear,
+                                     address::clamp_to_edge);
+  float4 blurred = float4(0.0);
+  float weight_sum = 0.0;
+  for (int y = -6; y <= 6; y++) {
+    if (abs(y) > kernel_radius) {
+      continue;
+    }
+    for (int x = -6; x <= 6; x++) {
+      if (abs(x) > kernel_radius) {
+        continue;
+      }
+      float fx = float(x);
+      float fy = float(y);
+      float weight = exp(-(fx * fx + fy * fy) / (2.0 * sigma * sigma));
+      float2 offset = float2(fx, fy) * texel;
+      blurred += source_texture.sample(backdrop_sampler, uv + offset) * weight;
+      weight_sum += weight;
+    }
+  }
+  if (weight_sum > 0.0) {
+    blurred /= weight_sum;
+  } else {
+    blurred = source_texture.sample(backdrop_sampler, uv);
+  }
+
+  float4 tint = hsla_to_rgba(backdrop.tint);
+  float4 color = over(blurred, tint);
+  return color * float4(1.0, 1.0, 1.0, edge_alpha);
+}
+
 // Returns the dash velocity of a corner given the dash velocity of the two
 // sides, by returning the slower velocity (larger dashes).
 //
