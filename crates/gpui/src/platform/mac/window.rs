@@ -316,16 +316,8 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
             window_will_enter_fullscreen as extern "C" fn(&Object, Sel, id),
         );
         decl.add_method(
-            sel!(windowDidEnterFullScreen:),
-            window_did_enter_fullscreen as extern "C" fn(&Object, Sel, id),
-        );
-        decl.add_method(
             sel!(windowWillExitFullScreen:),
             window_will_exit_fullscreen as extern "C" fn(&Object, Sel, id),
-        );
-        decl.add_method(
-            sel!(windowDidExitFullScreen:),
-            window_did_exit_fullscreen as extern "C" fn(&Object, Sel, id),
         );
         decl.add_method(
             sel!(windowDidMove:),
@@ -2027,39 +2019,26 @@ extern "C" fn window_will_enter_fullscreen(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
     lock.fullscreen_restore_bounds = lock.bounds();
-}
 
-extern "C" fn window_did_enter_fullscreen(this: &Object, _: Sel, _: id) {
-    let window_state = unsafe { get_window_state(this) };
-    let mut lock = window_state.as_ref().lock();
-    sync_titlebar_appearance_for_fullscreen(&mut lock, true);
+    unsafe {
+        // Match native fullscreen behavior: let the system own titlebar visuals while entering
+        // fullscreen so top-edge reveal can work consistently.
+        lock.native_window.setTitlebarAppearsTransparent_(NO);
+        lock.native_window
+            .setTitleVisibility_(NSWindowTitleVisibility::NSWindowTitleVisible);
+    }
 }
 
 extern "C" fn window_will_exit_fullscreen(this: &Object, _: Sel, _: id) {
-    let _ = unsafe { get_window_state(this) };
-}
-
-extern "C" fn window_did_exit_fullscreen(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
-    sync_titlebar_appearance_for_fullscreen(&mut lock, false);
-}
 
-fn sync_titlebar_appearance_for_fullscreen(lock: &mut MacWindowState, in_fullscreen: bool) {
     unsafe {
-        if in_fullscreen {
-            lock.native_window.setTitlebarAppearsTransparent_(NO);
-            lock.native_window
-                .setTitleVisibility_(NSWindowTitleVisibility::NSWindowTitleVisible);
-            return;
-        }
-
         if lock.transparent_titlebar {
             lock.native_window.setTitlebarAppearsTransparent_(YES);
             lock.native_window
                 .setTitleVisibility_(NSWindowTitleVisibility::NSWindowTitleHidden);
         } else {
-            lock.native_window.setTitlebarAppearsTransparent_(NO);
             lock.native_window
                 .setTitleVisibility_(NSWindowTitleVisibility::NSWindowTitleVisible);
         }
